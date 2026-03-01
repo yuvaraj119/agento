@@ -8,6 +8,7 @@ import {
   Plug,
   Plus,
   MessageCircle,
+  FileText,
   GitBranch,
 } from 'lucide-react'
 import { integrationsApi } from '@/lib/api'
@@ -44,6 +45,13 @@ const AVAILABLE_PROVIDERS = [
     description: 'Send messages, photos, polls & more',
     icon: <MessageCircle className="h-6 w-6 text-[#2AABEE]" />,
     path: '/integrations/telegram',
+  },
+  {
+    id: 'confluence',
+    name: 'Confluence',
+    description: 'Browse spaces, search, and manage pages',
+    icon: <FileText className="h-6 w-6 text-[#0052CC]" />,
+    path: '/integrations/confluence',
   },
   {
     id: 'jira',
@@ -166,6 +174,8 @@ function IntegrationTypeIcon({ type, size }: Readonly<{ type: string; size: numb
   if (type === 'google') return <GoogleIcon size={size} />
   if (type === 'telegram')
     return <MessageCircle style={{ width: size, height: size }} className="text-[#2AABEE]" />
+  if (type === 'confluence')
+    return <FileText style={{ width: size, height: size }} className="text-[#0052CC]" />
   if (type === 'jira')
     return <GitBranch style={{ width: size, height: size }} className="text-[#0052CC]" />
   return <Plug className="h-4 w-4 text-zinc-400" />

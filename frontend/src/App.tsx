@@ -12,6 +12,7 @@ import ClaudeSessionDetailPage from '@/pages/ClaudeSessionDetailPage'
 import TokenUsagePage from '@/pages/TokenUsagePage'
 import GeneralUsagePage from '@/pages/GeneralUsagePage'
 import IntegrationsPage from '@/pages/IntegrationsPage'
+import IntegrationConfluencePage from '@/pages/IntegrationConfluencePage'
 import IntegrationGooglePage from '@/pages/IntegrationGooglePage'
 import IntegrationTelegramPage from '@/pages/IntegrationTelegramPage'
 import IntegrationJiraPage from '@/pages/IntegrationJiraPage'
@@ -87,6 +88,7 @@ export default function App() {
             <Route path="analytics/token-usage" element={<TokenUsagePage />} />
             <Route path="analytics/general-usage" element={<GeneralUsagePage />} />
             <Route path="integrations" element={<IntegrationsPage />} />
+            <Route path="integrations/confluence" element={<IntegrationConfluencePage />} />
             <Route path="integrations/google" element={<IntegrationGooglePage />} />
             <Route path="integrations/telegram" element={<IntegrationTelegramPage />} />
             <Route path="integrations/jira" element={<IntegrationJiraPage />} />

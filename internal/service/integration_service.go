@@ -15,6 +15,7 @@ import (
 
 	"github.com/shaharia-lab/agento/internal/config"
 	"github.com/shaharia-lab/agento/internal/integrations"
+	"github.com/shaharia-lab/agento/internal/integrations/confluence"
 	"github.com/shaharia-lab/agento/internal/integrations/google"
 	"github.com/shaharia-lab/agento/internal/integrations/jira"
 	"github.com/shaharia-lab/agento/internal/integrations/telegram"
@@ -84,6 +85,8 @@ func validateIntegrationCredentials(cfg *config.IntegrationConfig) error {
 	switch cfg.Type {
 	case "google":
 		return validateGoogleCredentials(cfg)
+	case "confluence":
+		return validateAtlassianCredentials(cfg)
 	case "telegram":
 		return validateTelegramCredentials(cfg)
 	case "jira":
@@ -106,6 +109,26 @@ func validateGoogleCredentials(cfg *config.IntegrationConfig) error {
 	}
 	if creds.ClientSecret == "" {
 		return &ValidationError{Field: "credentials.client_secret", Message: "client_secret is required"}
+	}
+	return nil
+}
+
+func validateAtlassianCredentials(cfg *config.IntegrationConfig) error {
+	var creds config.AtlassianCredentials
+	if err := cfg.ParseCredentials(&creds); err != nil {
+		return &ValidationError{Field: "credentials", Message: "invalid confluence credentials: " + err.Error()}
+	}
+	if creds.SiteURL == "" {
+		return &ValidationError{Field: "credentials.site_url", Message: "site_url is required"}
+	}
+	if _, err := confluence.ValidateSiteURL(creds.SiteURL); err != nil {
+		return &ValidationError{Field: "credentials.site_url", Message: err.Error()}
+	}
+	if creds.Email == "" {
+		return &ValidationError{Field: "credentials.email", Message: "email is required"}
+	}
+	if creds.APIToken == "" {
+		return &ValidationError{Field: "credentials.api_token", Message: "api_token is required"}
 	}
 	return nil
 }
@@ -371,10 +394,13 @@ func (s *integrationService) AvailableTools(_ context.Context) ([]AvailableTool,
 }
 
 // ValidateTokenAuth validates token-based authentication for an integration.
-// For supported types (e.g. Telegram, Jira), it calls the service's API to verify credentials.
-// On success it marks the integration as authenticated, saves it, and reloads its MCP server.
+// For supported types (e.g. Telegram, Confluence, Jira), it calls the service's API to verify the
+// credentials. On success it marks the integration as authenticated, saves it, and reloads its
+// MCP server.
 func (s *integrationService) ValidateTokenAuth(ctx context.Context, cfg *config.IntegrationConfig) error {
 	switch cfg.Type {
+	case "confluence":
+		return s.validateConfluenceAuth(ctx, cfg)
 	case "telegram":
 		return s.validateTelegramTokenAuth(ctx, cfg)
 	case "jira":
@@ -385,13 +411,39 @@ func (s *integrationService) ValidateTokenAuth(ctx context.Context, cfg *config.
 	}
 }
 
+func (s *integrationService) validateConfluenceAuth(ctx context.Context, cfg *config.IntegrationConfig) error {
+	if err := validateAtlassianCredentials(cfg); err != nil {
+		return err
+	}
+
+	var creds config.AtlassianCredentials
+	if err := cfg.ParseCredentials(&creds); err != nil {
+		return &ValidationError{Field: "credentials", Message: "invalid confluence credentials: " + err.Error()}
+	}
+
+	if err := confluence.ValidateCredentials(ctx, creds.SiteURL, creds.Email, creds.APIToken); err != nil {
+		return &ValidationError{Field: "credentials", Message: "invalid credentials: " + err.Error()}
+	}
+
+	cfg.Auth = json.RawMessage(`{"validated":true}`)
+	cfg.UpdatedAt = time.Now().UTC()
+	if saveErr := s.store.Save(cfg); saveErr != nil {
+		return fmt.Errorf("saving validated integration: %w", saveErr)
+	}
+
+	s.logger.Info("confluence credentials validated", "id", cfg.ID)
+	s.reloadIntegration(cfg.ID)
+	return nil
+}
+
 func (s *integrationService) validateTelegramTokenAuth(ctx context.Context, cfg *config.IntegrationConfig) error {
+	if err := validateTelegramCredentials(cfg); err != nil {
+		return err
+	}
+
 	var creds config.TelegramCredentials
 	if err := cfg.ParseCredentials(&creds); err != nil {
 		return &ValidationError{Field: "credentials", Message: "invalid telegram credentials: " + err.Error()}
-	}
-	if creds.BotToken == "" {
-		return &ValidationError{Field: "credentials.bot_token", Message: "bot_token is required"}
 	}
 
 	username, err := telegram.ValidateBotToken(ctx, creds.BotToken)
@@ -406,13 +458,7 @@ func (s *integrationService) validateTelegramTokenAuth(ctx context.Context, cfg 
 	}
 
 	s.logger.Info("telegram bot validated", "id", cfg.ID, "username", username)
-
-	go func() {
-		if reloadErr := s.registry.Reload(s.parentCtx, cfg.ID); reloadErr != nil {
-			s.logger.Warn("failed to start integration server after validation", "id", cfg.ID, "error", reloadErr)
-		}
-	}()
-
+	s.reloadIntegration(cfg.ID)
 	return nil
 }
 
@@ -440,12 +486,15 @@ func (s *integrationService) validateJiraTokenAuth(ctx context.Context, cfg *con
 	}
 
 	s.logger.Info("jira integration validated", "id", cfg.ID, "display_name", displayName)
+	s.reloadIntegration(cfg.ID)
+	return nil
+}
 
+// reloadIntegration starts or reloads the MCP server for an integration in the background.
+func (s *integrationService) reloadIntegration(id string) {
 	go func() {
-		if reloadErr := s.registry.Reload(s.parentCtx, cfg.ID); reloadErr != nil {
-			s.logger.Warn("failed to start integration server after validation", "id", cfg.ID, "error", reloadErr)
+		if reloadErr := s.registry.Reload(s.parentCtx, id); reloadErr != nil {
+			s.logger.Warn("failed to start integration server after validation", "id", id, "error", reloadErr)
 		}
 	}()
-
-	return nil
 }
