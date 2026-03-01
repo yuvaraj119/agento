@@ -116,4 +116,6 @@ type TaskStore interface {
 	GetJobHistory(id string) (*JobHistory, error)
 	CreateJobHistory(jh *JobHistory) error
 	UpdateJobHistory(jh *JobHistory) error
+	DeleteJobHistory(id string) error
+	BulkDeleteJobHistory(ids []string) error
 }
