@@ -20,6 +20,7 @@ type tokenAccumulator struct {
 	OutputTokens             int
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
+	WebSearchRequests        int
 }
 
 func (t *tokenAccumulator) add(r *claude.Result) {
@@ -30,6 +31,7 @@ func (t *tokenAccumulator) add(r *claude.Result) {
 	t.OutputTokens += r.Usage.OutputTokens
 	t.CacheCreationInputTokens += r.Usage.CacheCreationInputTokens
 	t.CacheReadInputTokens += r.Usage.CacheReadInputTokens
+	t.WebSearchRequests += r.Usage.WebSearchRequests
 }
 
 func (t *tokenAccumulator) toUsageStats() agent.UsageStats {
@@ -38,6 +40,7 @@ func (t *tokenAccumulator) toUsageStats() agent.UsageStats {
 		OutputTokens:             t.OutputTokens,
 		CacheCreationInputTokens: t.CacheCreationInputTokens,
 		CacheReadInputTokens:     t.CacheReadInputTokens,
+		WebSearchRequests:        t.WebSearchRequests,
 	}
 }
 
@@ -500,6 +503,30 @@ func (s *Server) handlePermissionResponse(w http.ResponseWriter, r *http.Request
 	default:
 		s.writeError(w, http.StatusConflict, "session is not currently awaiting a permission response")
 	}
+}
+
+// handleStopSession gracefully stops the active agent session for a chat.
+// It sends SIGINT to the subprocess, giving it a chance to finish cleanly.
+// The deferred cleanup in handleSendMessage is responsible for the final
+// session.Close() call, so we do not call Close() here to avoid a double-close.
+func (s *Server) handleStopSession(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	ls, ok := s.liveSessions.get(id)
+	if !ok {
+		s.writeError(w, http.StatusConflict, "no active session for this chat")
+		return
+	}
+
+	// Interrupt sends SIGINT to the subprocess, giving it a chance to
+	// finish the current operation and write the session to disk.
+	// The SSE handler's deferred cleanup will call Close() once the
+	// event loop exits, so we do not call Close() here.
+	if err := ls.session.Interrupt(); err != nil {
+		s.logger.Warn("interrupt session failed", "session_id", id, "error", err)
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // extractAskUserQuestionInput parses a raw assistant event and returns the
