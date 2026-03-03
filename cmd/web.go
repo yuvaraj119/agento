@@ -36,8 +36,13 @@ import (
 	"github.com/shaharia-lab/agento/internal/server"
 	"github.com/shaharia-lab/agento/internal/service"
 	"github.com/shaharia-lab/agento/internal/storage"
+	"github.com/shaharia-lab/agento/internal/telemetry"
 	"github.com/shaharia-lab/agento/internal/tools"
 )
+
+// noopCleanup is a no-op cleanup function returned on early-exit error paths
+// where no resources have been acquired yet.
+var noopCleanup = func() {} //nolint:gochecknoglobals
 
 // NewWebCmd returns the "web" subcommand that starts the HTTP server.
 func NewWebCmd(cfg *config.AppConfig) *cobra.Command {
@@ -82,9 +87,9 @@ func runWeb(cfg *config.AppConfig, noBrowser bool) error {
 		return err
 	}
 
-	sysLogger, logCleanup, err := logger.NewSystemLogger(cfg.LogDir(), cfg.SlogLevel())
+	otelCfg, otelProviders, sysLogger, logCleanup, err := initObservability(ctx, cfg)
 	if err != nil {
-		return fmt.Errorf("initializing logger: %w", err)
+		return err
 	}
 	defer logCleanup()
 
@@ -102,11 +107,18 @@ func runWeb(cfg *config.AppConfig, noBrowser bool) error {
 	}
 	defer dbCleanup()
 
-	srv, err := buildWebServer(ctx, cfg, db, sysLogger)
+	srv, monitoringMgr, err := buildWebServer(ctx, cfg, db, sysLogger, otelCfg, otelProviders)
 	if err != nil {
 		sysLogger.Error("startup failed", "error", err)
 		return err
 	}
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if shutdownErr := monitoringMgr.Shutdown(shutdownCtx); shutdownErr != nil {
+			sysLogger.Error("telemetry shutdown error", "error", shutdownErr)
+		}
+	}()
 
 	url := fmt.Sprintf("http://localhost:%d", cfg.Port)
 	sysLogger.Info("server ready", "url", url)
@@ -116,6 +128,47 @@ func runWeb(cfg *config.AppConfig, noBrowser bool) error {
 	}
 
 	return srv.Run(ctx)
+}
+
+// initObservability initializes OpenTelemetry and the structured logger, then logs the
+// telemetry mode. It returns the monitoring config, providers, logger, and a cleanup func.
+func initObservability(
+	ctx context.Context, cfg *config.AppConfig,
+) (telemetry.MonitoringConfig, *telemetry.Providers, *slog.Logger, func(), error) {
+	otelCfg := telemetry.ConfigFromEnv()
+	otelProviders, err := telemetry.Init(ctx, otelCfg)
+	if err != nil {
+		return otelCfg, nil, nil, noopCleanup, fmt.Errorf("initializing telemetry: %w", err)
+	}
+
+	sysLogger, logCleanup, err := logger.NewSystemLogger(cfg.LogDir(), cfg.SlogLevel())
+	if err != nil {
+		// Shut down already-initialized OTel providers before returning.
+		// Logger is unavailable here so use the default slog sink.
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if shutdownErr := otelProviders.Shutdown(shutdownCtx); shutdownErr != nil {
+			slog.Default().Error("telemetry shutdown during logger init failure", "error", shutdownErr)
+		}
+		return otelCfg, nil, nil, noopCleanup, fmt.Errorf("initializing logger: %w", err)
+	}
+
+	logTelemetryMode(sysLogger, otelCfg)
+
+	return otelCfg, otelProviders, sysLogger, logCleanup, nil
+}
+
+// logTelemetryMode logs whether telemetry is enabled or disabled with the configured exporters.
+func logTelemetryMode(logger *slog.Logger, cfg telemetry.MonitoringConfig) {
+	if cfg.Enabled {
+		logger.Info("telemetry enabled",
+			"metrics_exporter", string(cfg.MetricsExporter),
+			"logs_exporter", string(cfg.LogsExporter),
+			"otlp_endpoint", cfg.OTLPEndpoint,
+		)
+		return
+	}
+	logger.Info("telemetry disabled (set OTEL_METRICS_EXPORTER or OTEL_EXPORTER_OTLP_ENDPOINT to enable)")
 }
 
 func ensureWebDirectories(cfg *config.AppConfig) error {
@@ -156,17 +209,18 @@ func initDatabase(cfg *config.AppConfig, sysLogger *slog.Logger) (*sql.DB, func(
 func buildWebServer(
 	ctx context.Context, cfg *config.AppConfig,
 	db *sql.DB, sysLogger *slog.Logger,
-) (*server.Server, error) {
+	otelCfg telemetry.MonitoringConfig, otelProviders *telemetry.Providers,
+) (*server.Server, *telemetry.MonitoringManager, error) {
 	agentStore := storage.NewSQLiteAgentStore(db)
 
 	mcpRegistry, err := config.LoadMCPRegistry(cfg.MCPsFile())
 	if err != nil {
-		return nil, fmt.Errorf("loading MCP registry: %w", err)
+		return nil, nil, fmt.Errorf("loading MCP registry: %w", err)
 	}
 
 	localToolsMCP, err := tools.StartLocalMCPServer(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("starting local tools MCP server: %w", err)
+		return nil, nil, fmt.Errorf("starting local tools MCP server: %w", err)
 	}
 
 	chatStore := storage.NewSQLiteChatStore(db)
@@ -185,8 +239,10 @@ func buildWebServer(
 	settingsStore := storage.NewSQLiteSettingsStore(db)
 	settingsMgr, err := config.NewSettingsManager(settingsStore, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("initializing settings: %w", err)
+		return nil, nil, fmt.Errorf("initializing settings: %w", err)
 	}
+
+	monitoringMgr := initMonitoringManager(cfg.DataDir, otelProviders, otelCfg, sysLogger)
 
 	apiSrv, bus, err := buildAPIServer(ctx, appDeps{
 		db:                  db,
@@ -198,11 +254,12 @@ func buildWebServer(
 		mcpRegistry:         mcpRegistry,
 		localToolsMCP:       localToolsMCP,
 		settingsMgr:         settingsMgr,
+		monitoringMgr:       monitoringMgr,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	srv := server.New(apiSrv, WebFS, cfg.Port, sysLogger)
+	srv := server.New(apiSrv, WebFS, cfg.Port, sysLogger, monitoringMgr)
 
 	// Ensure the event bus is drained cleanly on shutdown.
 	go func() {
@@ -210,7 +267,20 @@ func buildWebServer(
 		bus.Close()
 	}()
 
-	return srv, nil
+	return srv, monitoringMgr, nil
+}
+
+// initMonitoringManager creates a MonitoringManager, loads any persisted config from
+// disk, and logs a warning on load failure (non-fatal).
+func initMonitoringManager(
+	dataDir string, providers *telemetry.Providers,
+	envCfg telemetry.MonitoringConfig, logger *slog.Logger,
+) *telemetry.MonitoringManager {
+	mgr := telemetry.NewMonitoringManager(dataDir, providers, envCfg)
+	if err := mgr.Load(); err != nil {
+		logger.Warn("failed to load persisted monitoring config", "error", err)
+	}
+	return mgr
 }
 
 // appDeps bundles the stores, registries, and configuration needed to wire up
@@ -226,6 +296,7 @@ type appDeps struct {
 	mcpRegistry         *config.MCPRegistry
 	localToolsMCP       *tools.LocalMCPConfig
 	settingsMgr         *config.SettingsManager
+	monitoringMgr       *telemetry.MonitoringManager
 }
 
 // buildAPIServer wires all services and returns the api.Server and the event bus.
@@ -263,6 +334,7 @@ func buildAPIServer(ctx context.Context, deps appDeps) (*api.Server, eventbus.Ev
 		SettingsMgr:     deps.settingsMgr,
 		Logger:          deps.logger,
 		SessionCache:    sessionCache,
+		MonitoringMgr:   deps.monitoringMgr,
 	})
 	return apiSrv, bus, nil
 }
