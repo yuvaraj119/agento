@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 
 	claude "github.com/shaharia-lab/claude-agent-sdk-go/claude"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/shaharia-lab/agento/internal/config"
 	"github.com/shaharia-lab/agento/internal/integrations"
 	"github.com/shaharia-lab/agento/internal/storage"
+	"github.com/shaharia-lab/agento/internal/telemetry"
 	"github.com/shaharia-lab/agento/internal/tools"
 )
 
@@ -145,6 +148,11 @@ func (s *chatService) CreateSession(
 	ctx, span := otel.Tracer("agento").Start(ctx, "chat.create_session")
 	defer span.End()
 
+	span.SetAttributes(
+		attribute.String("chat.agent_slug", agentSlug),
+		attribute.String("chat.model", model),
+	)
+
 	// Validate agent slug if provided.
 	if agentSlug != "" {
 		agentCfg, err := s.agentRepo.Get(ctx, agentSlug)
@@ -165,6 +173,14 @@ func (s *chatService) CreateSession(
 		return nil, fmt.Errorf("creating session: %w", err)
 	}
 
+	span.SetAttributes(attribute.String("chat.session_id", session.ID))
+
+	if instr := telemetry.GetGlobalInstruments(); instr != nil {
+		instr.ChatSessionsCreated.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("agent_slug", agentSlug),
+		))
+	}
+
 	s.logger.Info("chat session created",
 		"session_id", session.ID,
 		"agent_slug", agentSlug,
@@ -177,11 +193,18 @@ func (s *chatService) DeleteSession(ctx context.Context, id string) error {
 	ctx, span := otel.Tracer("agento").Start(ctx, "chat.delete_session")
 	defer span.End()
 
+	span.SetAttributes(attribute.String("chat.session_id", id))
+
 	if err := s.chatRepo.DeleteSession(ctx, id); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		return fmt.Errorf("deleting session %q: %w", id, err)
 	}
+
+	if instr := telemetry.GetGlobalInstruments(); instr != nil {
+		instr.ChatSessionsDeleted.Add(ctx, 1)
+	}
+
 	s.logger.Info("chat session deleted", "session_id", id)
 	return nil
 }
@@ -206,6 +229,8 @@ func (s *chatService) BeginMessage(
 	ctx, span := otel.Tracer("agento").Start(ctx, "chat.begin_message")
 	defer span.End()
 
+	span.SetAttributes(attribute.String("chat.session_id", sessionID))
+
 	session, err := s.chatRepo.GetSession(ctx, sessionID)
 	if err != nil {
 		span.RecordError(err)
@@ -215,6 +240,11 @@ func (s *chatService) BeginMessage(
 	if session == nil {
 		return nil, nil, &NotFoundError{Resource: "chat", ID: sessionID}
 	}
+
+	span.SetAttributes(
+		attribute.String("chat.agent_slug", session.AgentSlug),
+		attribute.String("chat.model", session.Model),
+	)
 
 	agentCfg, err := s.resolveAgentConfig(ctx, session)
 	if err != nil {

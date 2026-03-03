@@ -6,6 +6,11 @@ import (
 	"strconv"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/shaharia-lab/agento/internal/agent"
 	"github.com/shaharia-lab/agento/internal/config"
 	"github.com/shaharia-lab/agento/internal/storage"
@@ -17,18 +22,32 @@ func (s *Scheduler) executeTask(taskID string) {
 	s.semaphore <- struct{}{}
 	defer func() { <-s.semaphore }()
 
-	ctx := context.Background()
+	// Root span for this task execution. Using context.Background() because
+	// scheduled tasks are not triggered by an HTTP request — they start a new
+	// trace rooted here.
+	ctx, span := otel.Tracer("agento").Start(context.Background(), "scheduler.task.execute")
+	span.SetAttributes(attribute.String("scheduler.task_id", taskID))
+	defer span.End()
+
 	task, err := s.cfg.TaskStore.GetTask(ctx, taskID)
 	if err != nil {
 		s.logger.Error("failed to load task for execution",
 			"task_id", taskID, "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return
 	}
 	if task == nil || task.Status != storage.TaskStatusActive {
 		return
 	}
 
-	if s.shouldAutoPause(task) {
+	span.SetAttributes(
+		attribute.String("scheduler.task_name", task.Name),
+		attribute.String("scheduler.agent_slug", task.AgentSlug),
+		attribute.String("scheduler.trigger", "scheduled"),
+	)
+
+	if s.shouldAutoPause(ctx, task) {
 		return
 	}
 
@@ -36,17 +55,17 @@ func (s *Scheduler) executeTask(taskID string) {
 		"task_id", task.ID, "task_name", task.Name,
 		"run_count", task.RunCount+1)
 
-	s.runTask(task)
+	s.runTask(ctx, task, span)
 }
 
 // shouldAutoPause checks stop conditions and pauses the task if met.
-func (s *Scheduler) shouldAutoPause(task *storage.ScheduledTask) bool {
+func (s *Scheduler) shouldAutoPause(ctx context.Context, task *storage.ScheduledTask) bool {
 	if task.StopAfterCount > 0 && task.RunCount >= task.StopAfterCount {
-		s.autoPause(task, "stop_after_count reached")
+		s.autoPause(ctx, task, "stop_after_count reached")
 		return true
 	}
 	if task.StopAfterTime != nil && time.Now().After(*task.StopAfterTime) {
-		s.autoPause(task, "stop_after_time reached")
+		s.autoPause(ctx, task, "stop_after_time reached")
 		return true
 	}
 	return false
@@ -56,78 +75,85 @@ func (s *Scheduler) shouldAutoPause(task *storage.ScheduledTask) bool {
 // initial job history record. On any failure it records the failed run,
 // publishes the failed event, and returns a non-nil error.
 func (s *Scheduler) prepareTaskRun(
-	task *storage.ScheduledTask, startedAt time.Time,
+	ctx context.Context, task *storage.ScheduledTask, startedAt time.Time,
 ) (prompt string, chatSession *storage.ChatSession, jh *storage.JobHistory, err error) {
 	prompt, err = agent.Interpolate(task.Prompt, nil)
 	if err != nil {
 		errMsg := fmt.Sprintf("prompt interpolation: %v", err)
 		s.logger.Error("failed to interpolate prompt", "task_id", task.ID, "error", err)
-		s.recordFailedRun(task, startedAt, "", errMsg)
+		s.recordFailedRun(ctx, task, startedAt, "", errMsg)
 		s.publishTaskFailed(task, errMsg)
 		return "", nil, nil, err
 	}
 
-	chatSession, err = s.createTaskSession(task)
+	chatSession, err = s.createTaskSession(ctx, task)
 	if err != nil {
 		errMsg := fmt.Sprintf("create session: %v", err)
 		s.logger.Error("failed to create chat session", "task_id", task.ID, "error", err)
-		s.recordFailedRun(task, startedAt, "", errMsg)
+		s.recordFailedRun(ctx, task, startedAt, "", errMsg)
 		s.publishTaskFailed(task, errMsg)
 		return "", nil, nil, err
 	}
 
-	jh = s.createInitialJobHistory(task, startedAt, chatSession.ID, prompt)
+	jh = s.createInitialJobHistory(ctx, task, startedAt, chatSession.ID, prompt)
 	return prompt, chatSession, jh, nil
 }
 
 // runTask performs the core task execution: prompt interpolation, session
 // creation, agent invocation, and result recording.
-func (s *Scheduler) runTask(task *storage.ScheduledTask) {
+// parentCtx carries the root trace span from executeTask.
+func (s *Scheduler) runTask(parentCtx context.Context, task *storage.ScheduledTask, parentSpan trace.Span) {
 	startedAt := time.Now().UTC()
 
-	prompt, chatSession, jh, err := s.prepareTaskRun(task, startedAt)
+	prompt, chatSession, jh, err := s.prepareTaskRun(parentCtx, task, startedAt)
 	if err != nil {
+		parentSpan.RecordError(err)
+		parentSpan.SetStatus(codes.Error, err.Error())
 		return
 	}
 
-	agentCfg, err := s.resolveAgentConfig(task)
+	agentCfg, err := s.resolveAgentConfig(parentCtx, task)
 	if err != nil {
 		errMsg := fmt.Sprintf("resolve agent: %v", err)
 		s.logger.Error("failed to resolve agent config",
 			"task_id", task.ID, "error", err)
-		s.finishJobHistory(jh, startedAt, storage.JobStatusFailed,
+		s.finishJobHistory(parentCtx, jh, startedAt, storage.JobStatusFailed,
 			errMsg, agent.UsageStats{}, "")
-		s.updateTaskAfterRun(task, startedAt, "failed")
+		s.updateTaskAfterRun(parentCtx, task, startedAt, "failed")
 		s.publishTaskFailed(task, errMsg)
+		parentSpan.RecordError(err)
+		parentSpan.SetStatus(codes.Error, errMsg)
 		return
 	}
 
 	opts := s.buildRunOptions(task)
 
 	timeout := time.Duration(task.TimeoutMinutes) * time.Minute
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel()
 
 	result, err := agent.RunAgent(ctx, agentCfg, prompt, opts)
 	if err != nil {
 		s.logger.Error("task execution failed",
 			"task_id", task.ID, "error", err)
-		s.finishJobHistory(jh, startedAt, storage.JobStatusFailed,
+		s.finishJobHistory(parentCtx, jh, startedAt, storage.JobStatusFailed,
 			err.Error(), agent.UsageStats{}, "")
-		s.updateTaskAfterRun(task, startedAt, "failed")
+		s.updateTaskAfterRun(parentCtx, task, startedAt, "failed")
 		s.publishTaskFailed(task, err.Error())
+		parentSpan.RecordError(err)
+		parentSpan.SetStatus(codes.Error, err.Error())
 		return
 	}
 
-	s.saveSessionResults(chatSession, result, prompt, startedAt)
+	s.saveSessionResults(parentCtx, chatSession, result, prompt, startedAt)
 	responseText := ""
 	if task.SaveOutput {
 		responseText = result.Answer
 	}
 	s.finishJobHistory(
-		jh, startedAt, storage.JobStatusSuccess, "", result.Usage, responseText,
+		parentCtx, jh, startedAt, storage.JobStatusSuccess, "", result.Usage, responseText,
 	)
-	s.updateTaskAfterRun(task, startedAt, "success")
+	s.updateTaskAfterRun(parentCtx, task, startedAt, "success")
 	s.publishTaskFinished(task, jh, chatSession.ID)
 
 	s.logger.Info("task execution completed",
@@ -137,9 +163,8 @@ func (s *Scheduler) runTask(task *storage.ScheduledTask) {
 
 // createTaskSession creates a chat session for the task execution.
 func (s *Scheduler) createTaskSession(
-	task *storage.ScheduledTask,
+	ctx context.Context, task *storage.ScheduledTask,
 ) (*storage.ChatSession, error) {
-	ctx := context.Background()
 	chatSession, err := s.cfg.ChatStore.CreateSession(
 		ctx,
 		task.AgentSlug, task.WorkingDirectory,
@@ -158,7 +183,7 @@ func (s *Scheduler) createTaskSession(
 
 // createInitialJobHistory creates and persists an initial job history record.
 func (s *Scheduler) createInitialJobHistory(
-	task *storage.ScheduledTask, startedAt time.Time,
+	ctx context.Context, task *storage.ScheduledTask, startedAt time.Time,
 	chatSessionID, prompt string,
 ) *storage.JobHistory {
 	promptPreview := prompt
@@ -175,7 +200,7 @@ func (s *Scheduler) createInitialJobHistory(
 		Model:         task.Model,
 		PromptPreview: promptPreview,
 	}
-	if err := s.cfg.TaskStore.CreateJobHistory(context.Background(), jh); err != nil {
+	if err := s.cfg.TaskStore.CreateJobHistory(ctx, jh); err != nil {
 		s.logger.Error("failed to create job history",
 			"task_id", task.ID, "error", err)
 	}
@@ -204,10 +229,9 @@ func (s *Scheduler) buildRunOptions(task *storage.ScheduledTask) agent.RunOption
 
 // saveSessionResults updates the chat session with agent results and stores messages.
 func (s *Scheduler) saveSessionResults(
-	chatSession *storage.ChatSession, result *agent.AgentResult,
+	ctx context.Context, chatSession *storage.ChatSession, result *agent.AgentResult,
 	prompt string, startedAt time.Time,
 ) {
-	ctx := context.Background()
 	chatSession.SDKSession = result.SessionID
 	chatSession.TotalInputTokens = result.Usage.InputTokens
 	chatSession.TotalOutputTokens = result.Usage.OutputTokens
@@ -240,9 +264,9 @@ func (s *Scheduler) saveSessionResults(
 	}
 }
 
-func (s *Scheduler) resolveAgentConfig(task *storage.ScheduledTask) (*config.AgentConfig, error) {
+func (s *Scheduler) resolveAgentConfig(ctx context.Context, task *storage.ScheduledTask) (*config.AgentConfig, error) {
 	if task.AgentSlug != "" {
-		agentCfg, err := s.cfg.AgentStore.Get(context.Background(), task.AgentSlug)
+		agentCfg, err := s.cfg.AgentStore.Get(ctx, task.AgentSlug)
 		if err != nil {
 			return nil, fmt.Errorf("loading agent %q: %w", task.AgentSlug, err)
 		}
@@ -264,7 +288,7 @@ func (s *Scheduler) resolveAgentConfig(task *storage.ScheduledTask) (*config.Age
 }
 
 func (s *Scheduler) finishJobHistory(
-	jh *storage.JobHistory, startedAt time.Time,
+	ctx context.Context, jh *storage.JobHistory, startedAt time.Time,
 	status storage.JobStatus, errMsg string, usage agent.UsageStats,
 	responseText string,
 ) {
@@ -279,12 +303,14 @@ func (s *Scheduler) finishJobHistory(
 	jh.TotalCacheCreationTokens = usage.CacheCreationInputTokens
 	jh.TotalCacheReadTokens = usage.CacheReadInputTokens
 
-	if err := s.cfg.TaskStore.UpdateJobHistory(context.Background(), jh); err != nil {
+	if err := s.cfg.TaskStore.UpdateJobHistory(ctx, jh); err != nil {
 		s.logger.Error("failed to update job history", "job_id", jh.ID, "error", err)
 	}
 }
 
-func (s *Scheduler) updateTaskAfterRun(task *storage.ScheduledTask, ranAt time.Time, status string) {
+func (s *Scheduler) updateTaskAfterRun(
+	ctx context.Context, task *storage.ScheduledTask, ranAt time.Time, status string,
+) {
 	task.RunCount++
 	task.LastRunAt = &ranAt
 	task.LastRunStatus = status
@@ -301,12 +327,14 @@ func (s *Scheduler) updateTaskAfterRun(task *storage.ScheduledTask, ranAt time.T
 		s.UnscheduleTask(task.ID)
 	}
 
-	if err := s.cfg.TaskStore.UpdateTask(context.Background(), task); err != nil {
+	if err := s.cfg.TaskStore.UpdateTask(ctx, task); err != nil {
 		s.logger.Error("failed to update task after run", "task_id", task.ID, "error", err)
 	}
 }
 
-func (s *Scheduler) recordFailedRun(task *storage.ScheduledTask, startedAt time.Time, chatSessionID, errMsg string) {
+func (s *Scheduler) recordFailedRun(
+	ctx context.Context, task *storage.ScheduledTask, startedAt time.Time, chatSessionID, errMsg string,
+) {
 	jh := &storage.JobHistory{
 		TaskID:        task.ID,
 		TaskName:      task.Name,
@@ -320,16 +348,16 @@ func (s *Scheduler) recordFailedRun(task *storage.ScheduledTask, startedAt time.
 	jh.FinishedAt = &now
 	jh.DurationMS = now.Sub(startedAt).Milliseconds()
 
-	if err := s.cfg.TaskStore.CreateJobHistory(context.Background(), jh); err != nil {
+	if err := s.cfg.TaskStore.CreateJobHistory(ctx, jh); err != nil {
 		s.logger.Error("failed to create failed job history", "task_id", task.ID, "error", err)
 	}
-	s.updateTaskAfterRun(task, startedAt, "failed")
+	s.updateTaskAfterRun(ctx, task, startedAt, "failed")
 }
 
-func (s *Scheduler) autoPause(task *storage.ScheduledTask, reason string) {
+func (s *Scheduler) autoPause(ctx context.Context, task *storage.ScheduledTask, reason string) {
 	s.logger.Info("auto-pausing task", "task_id", task.ID, "reason", reason)
 	task.Status = storage.TaskStatusPaused
-	if err := s.cfg.TaskStore.UpdateTask(context.Background(), task); err != nil {
+	if err := s.cfg.TaskStore.UpdateTask(ctx, task); err != nil {
 		s.logger.Error("failed to auto-pause task", "task_id", task.ID, "error", err)
 	}
 	s.UnscheduleTask(task.ID)

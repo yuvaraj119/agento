@@ -22,8 +22,12 @@ func NewSQLiteChatStore(db *sql.DB) *SQLiteChatStore {
 }
 
 // ListSessions returns all chat sessions ordered by most recently updated.
-func (s *SQLiteChatStore) ListSessions(ctx context.Context) ([]*ChatSession, error) {
-	rows, err := s.db.QueryContext(ctx, `
+func (s *SQLiteChatStore) ListSessions(ctx context.Context) (sessions []*ChatSession, err error) {
+	ctx, end := withStorageSpan(ctx, "list", "chat_session")
+	defer func() { end(err) }()
+
+	var rows *sql.Rows
+	rows, err = s.db.QueryContext(ctx, `
 		SELECT id, title, agent_slug, sdk_session_id, working_directory, model,
 		       settings_profile_id, total_input_tokens, total_output_tokens,
 		       total_cache_creation_tokens, total_cache_read_tokens,
@@ -35,19 +39,23 @@ func (s *SQLiteChatStore) ListSessions(ctx context.Context) ([]*ChatSession, err
 	}
 	defer rows.Close() //nolint:errcheck
 
-	sessions := make([]*ChatSession, 0)
+	sessions = make([]*ChatSession, 0)
 	for rows.Next() {
-		cs, err := scanChatSession(rows)
-		if err != nil {
-			return nil, err
+		cs, scanErr := scanChatSession(rows)
+		if scanErr != nil {
+			return nil, scanErr
 		}
 		sessions = append(sessions, cs)
 	}
-	return sessions, rows.Err()
+	err = rows.Err()
+	return sessions, err
 }
 
 // GetSession returns session metadata for the given ID, or nil if not found.
-func (s *SQLiteChatStore) GetSession(ctx context.Context, id string) (*ChatSession, error) {
+func (s *SQLiteChatStore) GetSession(ctx context.Context, id string) (cs *ChatSession, err error) {
+	ctx, end := withStorageSpan(ctx, "get", "chat_session")
+	defer func() { end(err) }()
+
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, title, agent_slug, sdk_session_id, working_directory, model,
 		       settings_profile_id, total_input_tokens, total_output_tokens,
@@ -55,8 +63,8 @@ func (s *SQLiteChatStore) GetSession(ctx context.Context, id string) (*ChatSessi
 		       created_at, updated_at
 		FROM chat_sessions WHERE id = ?`, id)
 
-	cs := &ChatSession{}
-	err := row.Scan(
+	cs = &ChatSession{}
+	err = row.Scan(
 		&cs.ID, &cs.Title, &cs.AgentSlug, &cs.SDKSession, &cs.WorkingDir,
 		&cs.Model, &cs.SettingsProfileID,
 		&cs.TotalInputTokens, &cs.TotalOutputTokens,
@@ -64,6 +72,7 @@ func (s *SQLiteChatStore) GetSession(ctx context.Context, id string) (*ChatSessi
 		&cs.CreatedAt, &cs.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
+		err = nil
 		return nil, nil
 	}
 	if err != nil {
@@ -111,10 +120,13 @@ func (s *SQLiteChatStore) GetSessionWithMessages(ctx context.Context, id string)
 // CreateSession creates a new chat session.
 func (s *SQLiteChatStore) CreateSession(
 	ctx context.Context, agentSlug, workingDir, model, settingsProfileID string,
-) (*ChatSession, error) {
+) (cs *ChatSession, err error) {
+	ctx, end := withStorageSpan(ctx, "create", "chat_session")
+	defer func() { end(err) }()
+
 	id := newSQLiteUUID()
 	now := time.Now().UTC()
-	cs := &ChatSession{
+	cs = &ChatSession{
 		ID:                id,
 		Title:             "New Chat",
 		AgentSlug:         agentSlug,
@@ -125,7 +137,7 @@ func (s *SQLiteChatStore) CreateSession(
 		UpdatedAt:         now,
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO chat_sessions
 			(id, title, agent_slug, sdk_session_id, working_directory, model,
 			 settings_profile_id, total_input_tokens, total_output_tokens,
@@ -141,17 +153,21 @@ func (s *SQLiteChatStore) CreateSession(
 }
 
 // AppendMessage appends a message to the given session.
-func (s *SQLiteChatStore) AppendMessage(ctx context.Context, sessionID string, msg ChatMessage) error {
+func (s *SQLiteChatStore) AppendMessage(ctx context.Context, sessionID string, msg ChatMessage) (err error) {
+	ctx, end := withStorageSpan(ctx, "append", "chat_message")
+	defer func() { end(err) }()
+
 	blocksJSON := "[]"
 	if len(msg.Blocks) > 0 {
-		b, err := json.Marshal(msg.Blocks)
+		var b []byte
+		b, err = json.Marshal(msg.Blocks)
 		if err != nil {
 			return fmt.Errorf("marshaling blocks: %w", err)
 		}
 		blocksJSON = string(b)
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO chat_messages (session_id, role, content, blocks, timestamp)
 		VALUES (?, ?, ?, ?, ?)`,
 		sessionID, msg.Role, msg.Content, blocksJSON, msg.Timestamp,
@@ -163,8 +179,12 @@ func (s *SQLiteChatStore) AppendMessage(ctx context.Context, sessionID string, m
 }
 
 // UpdateSession updates a session's metadata.
-func (s *SQLiteChatStore) UpdateSession(ctx context.Context, session *ChatSession) error {
-	res, err := s.db.ExecContext(ctx, `
+func (s *SQLiteChatStore) UpdateSession(ctx context.Context, session *ChatSession) (err error) {
+	ctx, end := withStorageSpan(ctx, "update", "chat_session")
+	defer func() { end(err) }()
+
+	var res sql.Result
+	res, err = s.db.ExecContext(ctx, `
 		UPDATE chat_sessions SET
 			title = ?, agent_slug = ?, sdk_session_id = ?, working_directory = ?,
 			model = ?, settings_profile_id = ?,
@@ -192,26 +212,34 @@ func (s *SQLiteChatStore) UpdateSession(ctx context.Context, session *ChatSessio
 }
 
 // DeleteSession deletes a session and its messages (via CASCADE).
-func (s *SQLiteChatStore) DeleteSession(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx, "DELETE FROM chat_sessions WHERE id = ?", id)
+func (s *SQLiteChatStore) DeleteSession(ctx context.Context, id string) (err error) {
+	ctx, end := withStorageSpan(ctx, "delete", "chat_session")
+	defer func() { end(err) }()
+
+	var res sql.Result
+	res, err = s.db.ExecContext(ctx, "DELETE FROM chat_sessions WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("deleting session %q: %w", id, err)
 	}
 	n, raErr := res.RowsAffected()
 	if raErr != nil {
-		return fmt.Errorf("checking rows affected for session %q: %w", id, raErr)
+		err = fmt.Errorf("checking rows affected for session %q: %w", id, raErr)
+		return err
 	}
 	if n == 0 {
-		return fmt.Errorf("session %q not found", id)
+		err = fmt.Errorf("session %q not found", id)
+		return err
 	}
 	return nil
 }
 
 // BulkDeleteSessions deletes multiple chat sessions (and their messages via CASCADE) by ID.
-func (s *SQLiteChatStore) BulkDeleteSessions(ctx context.Context, ids []string) error {
+func (s *SQLiteChatStore) BulkDeleteSessions(ctx context.Context, ids []string) (err error) {
 	if len(ids) == 0 {
 		return nil
 	}
+	ctx, end := withStorageSpan(ctx, "bulk_delete", "chat_session")
+	defer func() { end(err) }()
 	placeholders := make([]string, len(ids))
 	args := make([]any, len(ids))
 	for i, id := range ids {
@@ -220,7 +248,7 @@ func (s *SQLiteChatStore) BulkDeleteSessions(ctx context.Context, ids []string) 
 	}
 	//nolint:gosec // placeholders are "?" repeated, not user input
 	query := "DELETE FROM chat_sessions WHERE id IN (" + strings.Join(placeholders, ",") + ")"
-	_, err := s.db.ExecContext(ctx, query, args...)
+	_, err = s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("bulk deleting sessions: %w", err)
 	}
