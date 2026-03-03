@@ -54,6 +54,7 @@ type Server struct {
 	logger             *slog.Logger
 	liveSessions       *liveSessionStore
 	claudeSessionCache *claudesessions.Cache
+	updateCache        updateCheckCache
 }
 
 // New creates a new API Server backed by the provided services.
@@ -118,8 +119,9 @@ func (s *Server) Mount(r chi.Router) {
 	// Filesystem, integrations, tasks, job history
 	s.mountExtensionRoutes(r)
 
-	// Build info
+	// Build info and update check
 	r.Get("/version", s.handleVersion)
+	r.Get("/version/update-check", s.handleUpdateCheck)
 }
 
 // mountExtensionRoutes registers filesystem, integration, task, and job-history routes.

@@ -29,6 +29,7 @@ import type {
   NotificationLogEntry,
   ScheduledTask,
   JobHistoryEntry,
+  UpdateCheckResponse,
 } from '../types'
 
 const BASE = '/api'
@@ -525,6 +526,12 @@ export const jobHistoryApi = {
     }).then(res => {
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
     }),
+}
+
+// ── Version / update check ────────────────────────────────────────────────────
+
+export const versionApi = {
+  checkUpdate: () => request<UpdateCheckResponse>('/version/update-check'),
 }
 
 // ── Analytics ─────────────────────────────────────────────────────────────────
