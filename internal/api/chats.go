@@ -10,6 +10,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	claude "github.com/shaharia-lab/claude-agent-sdk-go/claude"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/shaharia-lab/agento/internal/agent"
 	"github.com/shaharia-lab/agento/internal/service"
@@ -242,11 +246,35 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	isFirstMessage := chatSession.Title == "New Chat"
+	// chat.begin_message ends immediately when StartSession returns (~ms).
+	// This span covers the actual agent streaming + commit (~seconds).
+	_, execSpan := otel.Tracer("agento").Start(r.Context(), "chat.agent_execution")
+	execSpan.SetAttributes(
+		attribute.String("chat.session_id", id),
+		attribute.String("chat.agent_slug", chatSession.AgentSlug),
+	)
 
+	isFirstMessage := chatSession.Title == "New Chat"
+	state := s.streamAgentSession(w, r, id, agentSession, chs, execSpan)
+
+	if isFirstMessage {
+		chatSession.Title = truncateTitle(req.Content, 60)
+	}
+	s.commitMessage(execSpan, chatSession, state, isFirstMessage, id)
+}
+
+// streamAgentSession sets up the SSE response, registers the live session,
+// runs the event loop, and returns the accumulated stream state.
+// execSpan is ended by the caller (commitMessage).
+func (s *Server) streamAgentSession(
+	w http.ResponseWriter, r *http.Request, id string,
+	agentSession *claude.Session, chs sendMessageChannels,
+	execSpan trace.Span,
+) streamState {
 	flusher, ok := s.prepareSSEResponse(w, agentSession)
 	if !ok {
-		return
+		execSpan.End()
+		return streamState{}
 	}
 
 	s.liveSessions.put(id, &liveSession{
@@ -271,12 +299,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		w:            w,
 		chs:          chs,
 	}
-	state := ep.consumeAgentEvents()
-
-	if isFirstMessage {
-		chatSession.Title = truncateTitle(req.Content, 60)
-	}
-	s.commitMessage(r, chatSession, state, isFirstMessage, id)
+	return ep.consumeAgentEvents()
 }
 
 func newSendMessageChannels() sendMessageChannels {
@@ -310,19 +333,29 @@ func (s *Server) prepareSSEResponse(
 }
 
 func (s *Server) commitMessage(
-	_ *http.Request, chatSession *storage.ChatSession,
+	execSpan trace.Span,
+	chatSession *storage.ChatSession,
 	state streamState, isFirstMessage bool, id string,
 ) {
-	// Use a fresh context so the commit always succeeds even if the SSE
-	// connection was canceled (e.g. client disconnected mid-stream).
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer execSpan.End()
+
+	// Detach from the SSE request context so the commit always succeeds even
+	// if the client disconnected mid-stream, but preserve the trace lineage so
+	// chat.commit_message appears as a child of chat.agent_execution.
+	commitCtx, cancel := context.WithTimeout(
+		trace.ContextWithSpanContext(context.Background(), execSpan.SpanContext()),
+		10*time.Second,
+	)
 	defer cancel()
+
 	if err := s.chatSvc.CommitMessage(
-		ctx, chatSession,
+		commitCtx, chatSession,
 		state.assistantText, state.sdkSessionID,
 		isFirstMessage, state.blocks,
 		state.tokens.toUsageStats(),
 	); err != nil {
+		execSpan.RecordError(err)
+		execSpan.SetStatus(codes.Error, err.Error())
 		s.logger.Error("commit message failed", "session_id", id, "error", err)
 	}
 }
