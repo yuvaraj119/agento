@@ -14,9 +14,12 @@ import {
   LayoutDashboard,
   CalendarClock,
   ClipboardList,
+  Info,
+  Star,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Tooltip } from '@/components/ui/tooltip'
+import AboutModal from '@/components/AboutModal'
 
 const STORAGE_KEY = 'agento-sidebar-collapsed'
 
@@ -52,6 +55,7 @@ interface SidebarProps {
 
 export default function Sidebar({ mobileOpen = false, onMobileClose }: SidebarProps) {
   const navigate = useNavigate()
+  const [aboutOpen, setAboutOpen] = useState(false)
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return localStorage.getItem(STORAGE_KEY) === 'true'
@@ -101,9 +105,14 @@ export default function Sidebar({ mobileOpen = false, onMobileClose }: SidebarPr
       >
         <AgentoLogo size={28} />
         {(isMobile || !collapsed) && (
-          <span className="text-[15px] font-semibold tracking-wide text-zinc-900 dark:text-zinc-100">
-            Agento
-          </span>
+          <div className="flex flex-col leading-tight">
+            <span className="text-[15px] font-semibold tracking-wide text-zinc-900 dark:text-zinc-100">
+              Agento
+            </span>
+            <span className="text-[10px] text-zinc-400 dark:text-zinc-500 tracking-wide">
+              for Claude Code
+            </span>
+          </div>
         )}
         {isMobile && (
           <button
@@ -333,6 +342,33 @@ export default function Sidebar({ mobileOpen = false, onMobileClose }: SidebarPr
             )}
           </div>
         </div>
+        {/* Mobile: Settings + About links */}
+        {isMobile && (
+          <div className="mt-4 border-t border-zinc-200 dark:border-zinc-700/50 pt-2 space-y-0.5">
+            <NavLink
+              to="/settings"
+              onClick={handleNavClick}
+              className={({ isActive }) =>
+                cn(
+                  'flex items-center gap-2.5 rounded-md px-3 py-2 text-sm transition-colors',
+                  isActive
+                    ? 'bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900'
+                    : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-200 dark:hover:bg-zinc-700 hover:text-zinc-900 dark:hover:text-zinc-100',
+                )
+              }
+            >
+              <Settings className="h-4 w-4 shrink-0" />
+              <span>Settings</span>
+            </NavLink>
+            <button
+              onClick={() => setAboutOpen(true)}
+              className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-sm text-zinc-600 dark:text-zinc-400 hover:bg-zinc-200 dark:hover:bg-zinc-700 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors cursor-pointer"
+            >
+              <Info className="h-4 w-4 shrink-0" />
+              <span>About</span>
+            </button>
+          </div>
+        )}
       </nav>
 
       {/* Settings link + Collapse toggle — desktop only */}
@@ -378,6 +414,39 @@ export default function Sidebar({ mobileOpen = false, onMobileClose }: SidebarPr
             </NavLink>
           )}
 
+          {/* About button */}
+          {collapsed ? (
+            <Tooltip content="About">
+              <button
+                onClick={() => setAboutOpen(true)}
+                className="flex h-9 w-9 items-center justify-center rounded-md transition-colors mx-auto mb-1 text-zinc-400 dark:text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-700 hover:text-zinc-700 dark:hover:text-zinc-200 cursor-pointer"
+              >
+                <Info className="h-4 w-4" />
+              </button>
+            </Tooltip>
+          ) : (
+            <button
+              onClick={() => setAboutOpen(true)}
+              className="flex items-center rounded-md text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors h-8 w-full px-3 gap-2 mb-1 cursor-pointer"
+            >
+              <Info className="h-4 w-4 shrink-0" />
+              <span className="text-[13px]">About</span>
+            </button>
+          )}
+
+          {/* Star on GitHub — only when expanded */}
+          {!collapsed && (
+            <a
+              href="https://github.com/shaharia-lab/agento"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center rounded-md text-zinc-400 dark:text-zinc-500 hover:text-amber-500 dark:hover:text-amber-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors h-8 w-full px-3 gap-2 mb-1"
+            >
+              <Star className="h-3.5 w-3.5 shrink-0" />
+              <span className="text-[12px]">Star on GitHub</span>
+            </a>
+          )}
+
           {/* Collapse toggle */}
           <button
             onClick={() => setCollapsed(c => !c)}
@@ -402,6 +471,8 @@ export default function Sidebar({ mobileOpen = false, onMobileClose }: SidebarPr
 
   return (
     <>
+      {aboutOpen && <AboutModal onClose={() => setAboutOpen(false)} />}
+
       {/* Desktop sidebar */}
       <aside
         className={cn(

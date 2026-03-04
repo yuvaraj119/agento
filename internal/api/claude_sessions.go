@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -73,6 +74,9 @@ func (s *Server) handleGetClaudeSession(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
+	// Attach user-defined fields from the SQLite cache (not present in JSONL).
+	detail.CustomTitle = s.claudeSessionCache.GetCustomTitle(id)
+	detail.IsFavorite = s.claudeSessionCache.GetFavorite(id)
 	s.writeJSON(w, http.StatusOK, detail)
 }
 
@@ -83,6 +87,40 @@ func (s *Server) handleRefreshClaudeSessionCache(w http.ResponseWriter, _ *http.
 	// Trigger rescan in background so the next list request gets fresh data.
 	go func() { s.claudeSessionCache.List() }()
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleUpdateClaudeSession updates mutable fields of a cached Claude Code session.
+// Supports custom_title and is_favorite — all JSONL-derived fields are read-only.
+func (s *Server) handleUpdateClaudeSession(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var req struct {
+		CustomTitle *string `json:"custom_title"`
+		IsFavorite  *bool   `json:"is_favorite"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, errInvalidJSONBody)
+		return
+	}
+	if req.CustomTitle == nil && req.IsFavorite == nil {
+		s.writeError(w, http.StatusBadRequest, "no fields to update")
+		return
+	}
+	if req.CustomTitle != nil {
+		title := strings.TrimSpace(*req.CustomTitle)
+		if err := s.claudeSessionCache.UpdateCustomTitle(id, title); err != nil {
+			s.logger.Error("update claude session title failed", "session_id", id, "error", err)
+			s.writeError(w, http.StatusInternalServerError, "failed to update title")
+			return
+		}
+	}
+	if req.IsFavorite != nil {
+		if err := s.claudeSessionCache.UpdateFavorite(id, *req.IsFavorite); err != nil {
+			s.logger.Error("update claude session favorite failed", "session_id", id, "error", err)
+			s.writeError(w, http.StatusInternalServerError, "failed to update favorite")
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleContinueClaudeSession creates a new Agento chat session that inherits the

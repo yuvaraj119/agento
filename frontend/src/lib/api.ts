@@ -75,6 +75,9 @@ export const chatsApi = {
 
   get: (id: string) => request<ChatDetail>(`/chats/${id}`),
 
+  updateTitle: (id: string, title: string) =>
+    request<ChatSession>(`/chats/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
+
   /**
    * Creates a new chat session.
    * @param agentSlug - optional agent slug. Pass empty string or omit for no-agent chat.
@@ -110,6 +113,12 @@ export const chatsApi = {
       body: JSON.stringify({ ids }),
     }).then(res => {
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    }),
+
+  toggleFavorite: (id: string, isFavorite: boolean) =>
+    request<ChatSession>(`/chats/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ is_favorite: isFavorite }),
     }),
 }
 
@@ -223,6 +232,26 @@ export const claudeSessionsApi = {
   continue: (sessionId: string) =>
     request<{ chat_id: string }>(`/claude-sessions/${sessionId}/continue`, {
       method: 'POST',
+    }),
+
+  /** Set a user-defined title for a session (preserved across cache rescans). */
+  updateTitle: (sessionId: string, customTitle: string) =>
+    fetch(`${BASE}/claude-sessions/${sessionId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ custom_title: customTitle }),
+    }).then(res => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    }),
+
+  /** Toggle the is_favorite flag for a session (preserved across cache rescans). */
+  toggleFavorite: (sessionId: string, isFavorite: boolean) =>
+    fetch(`${BASE}/claude-sessions/${sessionId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_favorite: isFavorite }),
+    }).then(res => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
     }),
 }
 

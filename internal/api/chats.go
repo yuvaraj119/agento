@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -151,6 +152,47 @@ func (s *Server) handleGetChat(w http.ResponseWriter, r *http.Request) {
 		"session":  session,
 		"messages": messages,
 	})
+}
+
+func (s *Server) handleUpdateChat(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var req struct {
+		Title      *string `json:"title"`
+		IsFavorite *bool   `json:"is_favorite"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, errInvalidJSONBody)
+		return
+	}
+	if req.Title == nil && req.IsFavorite == nil {
+		s.writeError(w, http.StatusBadRequest, "no fields to update")
+		return
+	}
+	if req.Title != nil {
+		trimmed := strings.TrimSpace(*req.Title)
+		if trimmed == "" {
+			s.writeError(w, http.StatusBadRequest, "title cannot be empty")
+			return
+		}
+		req.Title = &trimmed
+	}
+	session, err := s.chatSvc.GetSession(r.Context(), id)
+	if err != nil || session == nil {
+		s.writeError(w, http.StatusNotFound, "chat not found")
+		return
+	}
+	if req.Title != nil {
+		session.Title = *req.Title
+	}
+	if req.IsFavorite != nil {
+		session.IsFavorite = *req.IsFavorite
+	}
+	if err := s.chatSvc.UpdateSession(r.Context(), session); err != nil {
+		s.logger.Error("update chat failed", "session_id", id, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to update chat")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, session)
 }
 
 func (s *Server) handleDeleteChat(w http.ResponseWriter, r *http.Request) {

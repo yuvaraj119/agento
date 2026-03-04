@@ -31,6 +31,7 @@ export interface ChatSession {
   total_output_tokens?: number
   total_cache_creation_tokens?: number
   total_cache_read_tokens?: number
+  is_favorite?: boolean
 }
 
 export interface UserSettings {
@@ -526,6 +527,8 @@ export interface ClaudeSessionSummary {
   session_id: string
   project_path: string
   preview: string
+  custom_title?: string
+  is_favorite?: boolean
   start_time: string
   last_activity: string
   message_count: number
