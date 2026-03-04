@@ -20,20 +20,11 @@ import {
   Loader2,
   Pencil,
   Star,
+  Activity,
 } from 'lucide-react'
+import { formatTokens, shortPath } from '@/lib/format'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-function formatTokens(n: number): string {
-  if (!n) return '—'
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
-  return String(n)
-}
-
-function shortPath(path: string): string {
-  return path.replace(/^\/home\/[^/]+\//, '~/')
-}
 
 function todoIcon(status: string) {
   if (status === 'completed')
@@ -452,6 +443,13 @@ export default function ClaudeSessionDetailPage() {
             title={detail.is_favorite ? 'Remove from favorites' : 'Add to favorites'}
           >
             <Star className={`h-4 w-4 ${detail.is_favorite ? 'fill-amber-400' : ''}`} />
+          </button>
+          <button
+            className="h-8 w-8 flex items-center justify-center rounded-md text-zinc-300 dark:text-zinc-600 hover:text-zinc-500 dark:hover:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors shrink-0"
+            onClick={() => navigate(`/claude-sessions/${id ?? ''}/journey`)}
+            title="View session journey"
+          >
+            <Activity className="h-4 w-4" />
           </button>
           <Button
             size="sm"
