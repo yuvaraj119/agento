@@ -34,6 +34,7 @@ import type {
   MonitoringConfig,
   MonitoringResponse,
   MonitoringTestResult,
+  InsightSummary,
 } from '../types'
 
 const BASE = '/api'
@@ -599,5 +600,23 @@ export const analyticsApi = {
     const query = qs.toString()
     const suffix = query ? `?${query}` : ''
     return request<AnalyticsReport>(`/claude-analytics${suffix}`)
+  },
+}
+
+// ── Session Insights ─────────────────────────────────────────────────────────
+
+export const insightsApi = {
+  /** Aggregate insights across multiple (or all) sessions, optionally filtered by date range. */
+  getSummary: (params?: {
+    ids?: string[]
+    from?: string
+    to?: string
+  }): Promise<InsightSummary> => {
+    const qs = new URLSearchParams()
+    if (params?.ids && params.ids.length > 0) qs.set('ids', params.ids.join(','))
+    if (params?.from) qs.set('from', params.from)
+    if (params?.to) qs.set('to', params.to)
+    const suffix = qs.toString() ? `?${qs.toString()}` : ''
+    return request<InsightSummary>(`/claude-sessions/insights/summary${suffix}`)
   },
 }
